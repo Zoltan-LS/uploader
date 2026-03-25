@@ -1,242 +1,150 @@
-# worker.py
+# worker.py - Optimized for large files
 import os
 import hashlib
 import logging
-from sqlalchemy.orm import Session
-from db import SessionLocal, File, Chunk, FileChunk
-from datetime import datetime
-import traceback
+from pathlib import Path
+from dotenv import load_dotenv
+import sys
+
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configuration
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 1024 * 1024))  # 1MB
 CHUNK_DIR = os.getenv("CHUNK_DIR", "chunks")
+if not os.path.isabs(CHUNK_DIR):
+    CHUNK_DIR = os.path.abspath(CHUNK_DIR)
+
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "temp")
+if not os.path.isabs(UPLOAD_DIR):
+    UPLOAD_DIR = os.path.abspath(UPLOAD_DIR)
+
+# Reduce chunk size for large files to use less memory
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 512 * 1024))  # 512KB instead of 1MB
+
+# Create directories
 os.makedirs(CHUNK_DIR, exist_ok=True)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+logger.info(f"CHUNK_DIR: {CHUNK_DIR}")
+logger.info(f"CHUNK_SIZE: {CHUNK_SIZE / 1024:.0f}KB")
 
 def get_chunk_path(hash_value):
-    """Convert hash to nested directory structure: chunks/ab/cd/abcdef123456..."""
+    """Convert hash to nested directory structure"""
     if len(hash_value) < 4:
-        return os.path.join(CHUNK_DIR, hash_value)
+        chunk_path = os.path.join(CHUNK_DIR, hash_value)
+    else:
+        first_level = hash_value[:2]
+        second_level = hash_value[2:4]
+        chunk_path = os.path.join(CHUNK_DIR, first_level, second_level, hash_value)
     
-    # Use first 2 chars as first level, next 2 chars as second level
-    first_level = hash_value[:2]
-    second_level = hash_value[2:4]
-    
-    # Create directories if they don't exist
-    chunk_dir = os.path.join(CHUNK_DIR, first_level, second_level)
-    os.makedirs(chunk_dir, exist_ok=True)
-    
-    return os.path.join(chunk_dir, hash_value)
+    os.makedirs(os.path.dirname(chunk_path), exist_ok=True)
+    return chunk_path
 
 def sha256(data):
-    """Calculate SHA256 hash of data"""
     return hashlib.sha256(data).hexdigest()
 
 def process_file(path, filename, file_id):
-    """
-    Process uploaded file:
-    - Split into chunks
-    - Deduplicate chunks
-    - Store file structure in database
-    """
+    """Process uploaded file with memory-efficient streaming"""
+    from db import SessionLocal, File, Chunk, FileChunk
+    from datetime import datetime
+    
     db = SessionLocal()
     
     try:
-        logger.info(f"Processing file: {filename} (ID: {file_id})")
+        file_size = os.path.getsize(path)
+        logger.info(f"Processing: {filename} ({file_size:,} bytes)")
         
         # Create file record
         db_file = File(
             id=file_id,
             filename=filename,
-            size=0,  # Will update after processing
+            size=file_size,
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow()
         )
         db.add(db_file)
         db.commit()
         
-        total_size = 0
-        chunk_index = 0
         chunks_processed = 0
         new_chunks = 0
         existing_chunks = 0
         
-        # Process file in chunks
+        # Process file in chunks without loading entire file into memory
         with open(path, "rb") as f:
+            index = 0
             while True:
+                # Read chunk
                 chunk_data = f.read(CHUNK_SIZE)
                 if not chunk_data:
                     break
                 
-                chunk_size = len(chunk_data)
-                total_size += chunk_size
-                
-                # Calculate hash
                 chunk_hash = sha256(chunk_data)
-                
-                # Get sharded path
                 chunk_path = get_chunk_path(chunk_hash)
                 
-                # Check if chunk already exists (using PostgreSQL transaction)
+                # Check for existing chunk
                 db_chunk = db.query(Chunk).filter(Chunk.hash == chunk_hash).first()
                 
                 if not db_chunk:
-                    # Save new chunk to disk
+                    # Save new chunk
                     with open(chunk_path, "wb") as cf:
                         cf.write(chunk_data)
                     
-                    # Create chunk record
                     db_chunk = Chunk(
                         hash=chunk_hash,
                         path=chunk_path,
                         ref_count=1,
-                        size=chunk_size,
+                        size=len(chunk_data),
                         created_at=datetime.utcnow()
                     )
                     db.add(db_chunk)
                     new_chunks += 1
-                    logger.debug(f"New chunk created: {chunk_hash[:16]}... ({chunk_size} bytes)")
                 else:
-                    # Increment reference count for existing chunk
                     db_chunk.ref_count += 1
                     existing_chunks += 1
-                    logger.debug(f"Existing chunk reused: {chunk_hash[:16]}... (ref_count: {db_chunk.ref_count})")
                 
-                # Create file-chunk mapping
-                file_chunk = FileChunk(
+                # Create mapping
+                db.add(FileChunk(
                     file_id=file_id,
                     chunk_hash=chunk_hash,
-                    order_index=chunk_index
-                )
-                db.add(file_chunk)
+                    order_index=index
+                ))
                 
-                chunk_index += 1
+                index += 1
                 chunks_processed += 1
                 
-                # Commit every 100 chunks to avoid huge transactions
-                if chunks_processed % 100 == 0:
+                # Commit more frequently for large files
+                if chunks_processed % 50 == 0:
                     db.commit()
-                    logger.info(f"Processed {chunks_processed} chunks for {filename}")
+                    logger.info(f"Processed {chunks_processed} chunks ({chunks_processed * CHUNK_SIZE / 1024 / 1024:.1f} MB)")
+                
+                # Clear chunk_data to free memory
+                chunk_data = None
         
-        # Update file with total size
-        db_file.size = total_size
         db.commit()
+        
+        dedup_rate = (existing_chunks / chunks_processed * 100) if chunks_processed else 0
         
         logger.info(
-            f"File processed successfully: {filename}\n"
-            f"  - File ID: {file_id}\n"
-            f"  - Size: {total_size} bytes ({total_size / (1024*1024):.2f} MB)\n"
-            f"  - Chunks: {chunks_processed} total ({new_chunks} new, {existing_chunks} existing)\n"
-            f"  - Deduplication saved: {(existing_chunks * CHUNK_SIZE) / (1024*1024):.2f} MB"
+            f"✓ File processed: {filename}\n"
+            f"  - Size: {file_size:,} bytes ({file_size/1024/1024:.1f} MB)\n"
+            f"  - Chunks: {chunks_processed} ({new_chunks} new, {existing_chunks} existing)\n"
+            f"  - Dedup rate: {dedup_rate:.1f}%"
         )
         
+    except MemoryError:
+        logger.error(f"Memory error processing {filename}. Consider reducing CHUNK_SIZE")
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
-        logger.error(f"Error processing file {filename}: {e}")
+        logger.error(f"Error processing file: {e}")
+        import traceback
         logger.error(traceback.format_exc())
         raise
-    
     finally:
         db.close()
-        
-        # Clean up temporary file
         if os.path.exists(path):
-            try:
-                os.remove(path)
-                logger.debug(f"Removed temporary file: {path}")
-            except Exception as e:
-                logger.error(f"Error removing temporary file {path}: {e}")
-
-# Optional: Add a cleanup function for chunks with ref_count=0
-def cleanup_unused_chunks(db: Session = None):
-    """Remove chunks with ref_count = 0 (should be run periodically)"""
-    if db is None:
-        db = SessionLocal()
-    
-    try:
-        # Find chunks with no references
-        unused_chunks = db.query(Chunk).filter(Chunk.ref_count == 0).all()
-        
-        if not unused_chunks:
-            logger.info("No unused chunks to clean up")
-            return 0
-        
-        logger.info(f"Found {len(unused_chunks)} unused chunks to clean up")
-        
-        cleaned = 0
-        for chunk in unused_chunks:
-            try:
-                # Delete physical file
-                if os.path.exists(chunk.path):
-                    os.remove(chunk.path)
-                    logger.debug(f"Deleted chunk file: {chunk.path}")
-                
-                # Delete database record
-                db.delete(chunk)
-                
-                # Try to remove empty directories
-                chunk_dir = os.path.dirname(chunk.path)
-                try:
-                    os.rmdir(chunk_dir)
-                    logger.debug(f"Removed empty directory: {chunk_dir}")
-                except OSError:
-                    # Directory not empty, ignore
-                    pass
-                
-                cleaned += 1
-                
-                # Commit every 100 deletions
-                if cleaned % 100 == 0:
-                    db.commit()
-                    logger.info(f"Cleaned up {cleaned}/{len(unused_chunks)} chunks")
-                    
-            except Exception as e:
-                logger.error(f"Error cleaning up chunk {chunk.hash}: {e}")
-                continue
-        
-        db.commit()
-        logger.info(f"Cleanup complete: removed {cleaned} unused chunks")
-        return cleaned
-        
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Error during cleanup: {e}")
-        raise
-    finally:
-        if db:
-            db.close()
-
-# Optional: Add a health check for worker
-def worker_health_check():
-    """Check if worker can connect to services"""
-    issues = []
-    
-    # Check database
-    try:
-        db = SessionLocal()
-        db.execute("SELECT 1")
-        db.close()
-        logger.info("Database connection: OK")
-    except Exception as e:
-        issues.append(f"Database: {e}")
-        logger.error(f"Database connection failed: {e}")
-    
-    # Check chunk directory
-    try:
-        os.makedirs(CHUNK_DIR, exist_ok=True)
-        logger.info(f"Chunk directory: {CHUNK_DIR} (OK)")
-    except Exception as e:
-        issues.append(f"Chunk directory: {e}")
-    
-    return issues
-
-if __name__ == "__main__":
-    # Run health check when worker starts
-    issues = worker_health_check()
-    if issues:
-        logger.warning(f"Health check issues: {issues}")
-    else:
-        logger.info("Worker health check passed")
+            os.remove(path)

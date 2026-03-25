@@ -7,10 +7,13 @@ requires-python = ">=3.9"
 dependencies = [
     "dotenv>=0.9.9",
     "fastapi>=0.128.8",
+    "numpy>=2.0.2",
+    "pillow>=11.3.0",
     "psycopg2-binary>=2.9.11",
     "python-multipart>=0.0.20",
     "redis>=7.0.1",
     "rq>=2.7.0",
     "sqlalchemy>=2.0.48",
     "uvicorn>=0.39.0",
+    "xxhash>=3.6.0",
 ]
