@@ -1,0 +1,15 @@
+/etc/systemd/system/rq@.service
+[Unit]
+Description=RQ Worker Number %i
+After=multi-user.target
+
+[Service]
+User=uploader
+Group=uploader
+WorkingDirectory=/home/uploader/uploader/
+ExecStart = /home/uploader/uploader/.venv/bin/rq worker %i
+Restart = always
+Type = simple
+
+[Install]
+WantedBy=multi-user.target

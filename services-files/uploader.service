@@ -1,0 +1,28 @@
+[Unit]
+Description=Uploader
+After=network.target
+StartLimitIntervalSec=1800
+StartLimitBurst=8
+
+[Service]
+PIDFile=/var/run/uploader.pid
+User=uploader
+Group=uploader
+WorkingDirectory=/home/uploader/uploader
+ExecStart=/home/uploader/uploader/.venv/bin/uvicorn  main:app --host 0.0.0.0
+
+# make sure log directory exists and owned by syslog
+PermissionsStartOnly=true
+#ExecStartPre=/bin/mkdir -p /var/log/backups
+#ExecStartPre=/bin/chown backups:backups /var/log/backups
+#ExecStartPre=/bin/chmod 755 /var/log/backups
+#StandardOutput=syslog
+#StandardError=syslog
+#SyslogIdentifier=Backup-server
+#StandardOutput=append:/var/log/warehouse/backupstwopointo.log
+StandardError=inherit
+Restart=on-failure
+RestartSec=180s
+
+[Install]
+WantedBy=multi-user.target
